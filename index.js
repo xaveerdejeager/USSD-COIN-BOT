@@ -16,6 +16,38 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
+// Sepolia Blockchain Connection
+const RPC_URL = process.env.RPC_URL || 'https://ethereum-sepolia-rpc.publicnode.com';
+const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || '0x0fEC3876f7BE924472156Cb9cB39E60cBF3a3C89';
+const TREASURY_PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
+
+const ERC20_ABI = [
+  'function transfer(address to, uint256 amount) returns (bool)'
+];
+
+let ussdContract = null;
+if (TREASURY_PRIVATE_KEY) {
+  const provider = new ethers.JsonRpcProvider(RPC_URL);
+  const treasuryWallet = new ethers.Wallet(TREASURY_PRIVATE_KEY, provider);
+  ussdContract = new ethers.Contract(CONTRACT_ADDRESS, ERC20_ABI, treasuryWallet);
+}
+
+// Background on-chain settlement so USSD never times out
+async function settleOnChain(recipientPhone, recipientAddress, amount) {
+  if (!ussdContract) return;
+  try {
+    const weiAmount = ethers.parseUnits(amount.toString(), 18);
+    const tx = await ussdContract.transfer(recipientAddress, weiAmount);
+    console.log(`On-chain tx sent: ${tx.hash}`);
+    await supabase
+      .from('wallets')
+      .update({ last_tx: tx.hash })
+      .eq('phone', recipientPhone);
+  } catch (err) {
+    console.error('On-chain settlement error:', err.message);
+  }
+}
+
 async function getOrCreateWallet(phone) {
   const { data } = await supabase
     .from('wallets')
@@ -61,7 +93,7 @@ app.post('/webhook', async (req, res) => {
 
     let reply = '';
     if (text.toLowerCase().includes('balance')) {
-      reply = `💵 *USSD Dollar Wallet*\nPhone: +${from}\nBalance: *${Number(user.balance).toFixed(2)} USSD* ($${Number(user.balance).toFixed(2)})\nWallet ID: \`${user.address.slice(0, 8)}...\``;
+      reply = `💵 *USSD Dollar Wallet*\nPhone: +${from}\nBalance: *${Number(user.balance).toFixed(2)} USSD* ($${Number(user.balance).toFixed(2)})\nWallet: \`${user.address}\``;
     } else if (text.toLowerCase().startsWith('send')) {
       const parts = text.split(' ');
       const amount = parseFloat(parts.at(1));
@@ -76,10 +108,11 @@ app.post('/webhook', async (req, res) => {
         const newTargetBal = Number(target.balance) + amount;
         await supabase.from('wallets').update({ balance: newSenderBal }).eq('phone', from);
         await supabase.from('wallets').update({ balance: newTargetBal }).eq('phone', recipient);
+        settleOnChain(recipient, target.address, amount);
         reply = `✅ Sent *${amount.toFixed(2)} USSD* to +${recipient}!\nNew Balance: *${newSenderBal.toFixed(2)} USSD*`;
       }
     } else {
-      reply = `👋 Welcome to *USSD Coin ($USSD)*!\nYour permanent dollar wallet is active (100.00 USSD welcome test credit).\n\nReply with:\n• *Balance* — Check your $USSD\n• *Send 10 +2348012345678* — Send dollars to any phone number`;
+      reply = `👋 Welcome to *USSD Coin ($USSD)*!\nReply with:\n• *Balance*\n• *Send 10 +2348012345678*`;
     }
 
     if (WHATSAPP_TOKEN && PHONE_NUMBER_ID) {
@@ -98,7 +131,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// 3. Africa's Talking USSD Endpoint with 4-Digit Security PIN + Supabase Storage
+// 3. Africa's Talking USSD Endpoint with PIN + Supabase + Sepolia On-Chain Settlement
 app.post('/ussd', async (req, res) => {
   try {
     const { phoneNumber, text } = req.body;
@@ -107,7 +140,6 @@ app.post('/ussd', async (req, res) => {
 
     let response = '';
 
-    // Force first-time users to create a 4-digit PIN
     if (!user.pin) {
       if (!text || text === '') {
         response = `CON Welcome to USSD Dollar ($USSD)!\nCreate a 4-digit PIN to secure your wallet:`;
@@ -115,10 +147,10 @@ app.post('/ussd', async (req, res) => {
         await supabase.from('wallets').update({ pin: text.trim() }).eq('phone', cleanPhone);
         response = `END PIN created successfully! Dial *384*51117# again to access your 100.00 USSD wallet.`;
       } else {
-        response = `END Invalid PIN. Please dial *384*51117# again and enter exactly 4 digits (e.g. 1234).`;
+        response = `END Invalid PIN. Dial *384*51117# and enter 4 digits.`;
       }
     } else if (!text || text === '') {
-      response = `CON USSD Dollar ($USSD)\n1. Check Balance\n2. Send $USSD\n3. Wallet Address`;
+      response = `CON USSD Dollar ($USSD)\n1. Check Balance\n2. Send $USSD\n3. Wallet & Last Tx`;
     } else if (text === '1') {
       response = `END Your Balance: ${Number(user.balance).toFixed(2)} USSD ($${Number(user.balance).toFixed(2)})`;
     } else if (text === '2') {
@@ -144,13 +176,17 @@ app.post('/ussd', async (req, res) => {
           await supabase.from('wallets').update({ balance: newSenderBal }).eq('phone', cleanPhone);
           await supabase.from('wallets').update({ balance: newTargetBal }).eq('phone', recipient);
 
-          response = `END Sent ${amount.toFixed(2)} USSD to +${recipient}!\nNew Balance: ${newSenderBal.toFixed(2)} USSD`;
+          // Trigger real Sepolia ERC-20 transfer in background
+          settleOnChain(recipient, target.address, amount);
+
+          response = `END Sent ${amount.toFixed(2)} USSD to +${recipient}!\nSettling on Sepolia...\nNew Balance: ${newSenderBal.toFixed(2)} USSD`;
         } else {
           response = `END Invalid amount or insufficient balance.`;
         }
       }
     } else if (text === '3') {
-      response = `END Your $USSD Wallet:\n${user.address}`;
+      const txInfo = user.last_tx ? `\nLast Tx: ${user.last_tx.slice(0, 14)}...` : '';
+      response = `END Wallet: ${user.address}${txInfo}`;
     } else {
       response = `END Invalid selection.`;
     }
