@@ -22,8 +22,10 @@ const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || '0x0fEC3876f7BE92447215
 const TREASURY_PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
 
 const ERC20_ABI = [
-  'function transfer(address to, uint256 amount) returns (bool)'
+  'function transfer(address to, uint256 amount) returns (bool)',
+  'function decimals() view returns (uint8)'
 ];
+
 
 let ussdContract = null;
 if (TREASURY_PRIVATE_KEY) {
@@ -36,7 +38,9 @@ if (TREASURY_PRIVATE_KEY) {
 async function settleOnChain(recipientPhone, recipientAddress, amount) {
   if (!ussdContract) return;
   try {
-    const weiAmount = ethers.parseUnits(amount.toString(), 18);
+   const decimals = await ussdContract.decimals();
+const weiAmount = ethers.parseUnits(amount.toString(), decimals);
+
     const tx = await ussdContract.transfer(recipientAddress, weiAmount);
     console.log(`On-chain tx sent: ${tx.hash}`);
     await supabase
