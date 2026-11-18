@@ -10,14 +10,13 @@ app.use(express.urlencoded({ extended: true }));
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'ussd_secret_123';
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
-const NGN_RATE = 1600; // 1 $USSD = 1,600 NGN
+const NGN_RATE = 1600;
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
 
-// Sepolia Blockchain Connection
 const RPC_URL = process.env.RPC_URL || 'https://ethereum-sepolia-rpc.publicnode.com';
 const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || '0x0fEC3876f7BE924472156Cb9cB39E60cBF3a3C89';
 const TREASURY_PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
@@ -34,7 +33,6 @@ if (TREASURY_PRIVATE_KEY) {
   ussdContract = new ethers.Contract(CONTRACT_ADDRESS, ERC20_ABI, treasuryWallet);
 }
 
-// Background on-chain settlement so USSD never times out
 async function settleOnChain(recipientPhone, recipientAddress, amount) {
   if (!ussdContract) return;
   try {
@@ -85,7 +83,6 @@ async function getOrCreateWallet(phone) {
   return newUser;
 }
 
-// 1. Meta WhatsApp Webhook Verification
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -96,7 +93,6 @@ app.get('/webhook', (req, res) => {
   res.sendStatus(403);
 });
 
-// 2. Incoming WhatsApp Messages Handler
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
   try {
@@ -135,7 +131,7 @@ app.post('/webhook', async (req, res) => {
 
     if (WHATSAPP_TOKEN && PHONE_NUMBER_ID) {
       await axios.post(
-      `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`,  
+      `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`,
         {
           messaging_product: 'whatsapp',
           to: from,
@@ -149,7 +145,6 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// 3. Africa's Talking USSD Endpoint with PIN + Supabase + Sepolia + NGN On/Off-Ramp
 app.post('/ussd', async (req, res) => {
   try {
     const { phoneNumber, text } = req.body;
@@ -239,3 +234,31 @@ app.post('/ussd', async (req, res) => {
         if (enteredPin !== user.pin) {
           response = `END Incorrect PIN. Cash out cancelled.`;
         } else if (!/^\d{10}$/.test(bankAcct)) {
+          response = `END Invalid account number. Must be 10 digits.`;
+        } else if (ussdAmount > 0 && ussdAmount <= Number(user.balance)) {
+          const ngnPayout = ussdAmount * NGN_RATE;
+          const newBal = Number(user.balance) - ussdAmount;
+          await supabase.from('wallets').update({ balance: newBal }).eq('phone', cleanPhone);
+          await logTransaction(cleanPhone, 'CASHOUT_NGN', ussdAmount, ngnPayout, bankAcct);
+          response = `END Cash Out Initiated!\nNGN ${ngnPayout.toLocaleString()} sent to Acct ${bankAcct}.\nNew Balance: ${newBal.toFixed(2)} USSD`;
+        } else {
+          response = `END Invalid amount or insufficient balance.`;
+        }
+      }
+    } else {
+      response = `END Invalid selection.`;
+    }
+
+    res.set('Content-Type', 'text/plain');
+    res.send(response);
+  } catch (err) {
+    console.error('USSD error:', err.message);
+    res.set('Content-Type', 'text/plain');
+    res.send('END Temporary service error. Please try again.');
+  }
+});
+
+app.get('/', (req, res) => res.send('USSD Coin Bot Server is Live!'));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
