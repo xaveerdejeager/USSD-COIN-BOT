@@ -10,6 +10,7 @@ app.use(express.urlencoded({ extended: true }));
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'ussd_secret_123';
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+const NGN_RATE = 1600; // 1 $USSD = 1,600 NGN
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -26,7 +27,6 @@ const ERC20_ABI = [
   'function decimals() view returns (uint8)'
 ];
 
-
 let ussdContract = null;
 if (TREASURY_PRIVATE_KEY) {
   const provider = new ethers.JsonRpcProvider(RPC_URL);
@@ -38,9 +38,8 @@ if (TREASURY_PRIVATE_KEY) {
 async function settleOnChain(recipientPhone, recipientAddress, amount) {
   if (!ussdContract) return;
   try {
-   const decimals = await ussdContract.decimals();
-const weiAmount = ethers.parseUnits(amount.toString(), decimals);
-
+    const decimals = await ussdContract.decimals();
+    const weiAmount = ethers.parseUnits(amount.toString(), decimals);
     const tx = await ussdContract.transfer(recipientAddress, weiAmount);
     console.log(`On-chain tx sent: ${tx.hash}`);
     await supabase
@@ -49,6 +48,20 @@ const weiAmount = ethers.parseUnits(amount.toString(), decimals);
       .eq('phone', recipientPhone);
   } catch (err) {
     console.error('On-chain settlement error:', err.message);
+  }
+}
+
+async function logTransaction(phone, type, amountUssd, amountNgn = null, bankAccount = null) {
+  try {
+    await supabase.from('transactions').insert({
+      phone,
+      type,
+      amount_ussd: amountUssd,
+      amount_ngn: amountNgn,
+      bank_account: bankAccount
+    });
+  } catch (err) {
+    console.error('Tx log error:', err.message);
   }
 }
 
@@ -112,6 +125,7 @@ app.post('/webhook', async (req, res) => {
         const newTargetBal = Number(target.balance) + amount;
         await supabase.from('wallets').update({ balance: newSenderBal }).eq('phone', from);
         await supabase.from('wallets').update({ balance: newTargetBal }).eq('phone', recipient);
+        await logTransaction(from, 'SEND', amount, amount * NGN_RATE, recipient);
         settleOnChain(recipient, target.address, amount);
         reply = `✅ Sent *${amount.toFixed(2)} USSD* to +${recipient}!\nNew Balance: *${newSenderBal.toFixed(2)} USSD*`;
       }
@@ -121,7 +135,7 @@ app.post('/webhook', async (req, res) => {
 
     if (WHATSAPP_TOKEN && PHONE_NUMBER_ID) {
       await axios.post(
-        `https://facebook.com{PHONE_NUMBER_ID}/messages`,
+      `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`,  
         {
           messaging_product: 'whatsapp',
           to: from,
@@ -135,7 +149,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// 3. Africa's Talking USSD Endpoint with PIN + Supabase + Sepolia On-Chain Settlement
+// 3. Africa's Talking USSD Endpoint with PIN + Supabase + Sepolia + NGN On/Off-Ramp
 app.post('/ussd', async (req, res) => {
   try {
     const { phoneNumber, text } = req.body;
@@ -154,9 +168,10 @@ app.post('/ussd', async (req, res) => {
         response = `END Invalid PIN. Dial *384*51117# and enter 4 digits.`;
       }
     } else if (!text || text === '') {
-      response = `CON USSD Dollar ($USSD)\n1. Check Balance\n2. Send $USSD\n3. Wallet & Last Tx`;
+      response = `CON USSD Dollar ($USSD)\n1. Check Balance\n2. Send $USSD\n3. Wallet & Last Tx\n4. Buy / Cash Out (NGN)`;
     } else if (text === '1') {
-      response = `END Your Balance: ${Number(user.balance).toFixed(2)} USSD ($${Number(user.balance).toFixed(2)})`;
+      const ngnVal = (Number(user.balance) * NGN_RATE).toLocaleString();
+      response = `END Balance: ${Number(user.balance).toFixed(2)} USSD ($${Number(user.balance).toFixed(2)})\nEst. Value: NGN ${ngnVal}`;
     } else if (text === '2') {
       response = `CON Enter recipient phone number (e.g. 2348012345678):`;
     } else if (text.startsWith('2*')) {
@@ -179,8 +194,8 @@ app.post('/ussd', async (req, res) => {
 
           await supabase.from('wallets').update({ balance: newSenderBal }).eq('phone', cleanPhone);
           await supabase.from('wallets').update({ balance: newTargetBal }).eq('phone', recipient);
+          await logTransaction(cleanPhone, 'SEND', amount, amount * NGN_RATE, recipient);
 
-          // Trigger real Sepolia ERC-20 transfer in background
           settleOnChain(recipient, target.address, amount);
 
           response = `END Sent ${amount.toFixed(2)} USSD to +${recipient}!\nSettling on Sepolia...\nNew Balance: ${newSenderBal.toFixed(2)} USSD`;
@@ -191,20 +206,36 @@ app.post('/ussd', async (req, res) => {
     } else if (text === '3') {
       const txInfo = user.last_tx ? `\nLast Tx: ${user.last_tx.slice(0, 14)}...` : '';
       response = `END Wallet: ${user.address}${txInfo}`;
-    } else {
-      response = `END Invalid selection.`;
-    }
+    } else if (text === '4') {
+      response = `CON Naira On/Off-Ramp (1 USSD = NGN ${NGN_RATE})\n1. Buy $USSD with Naira\n2. Cash Out $USSD to Bank`;
+    } else if (text === '4*1') {
+      response = `CON Enter amount in Naira (NGN) to deposit (e.g. 16000):`;
+    } else if (text.startsWith('4*1*')) {
+      const parts = text.split('*');
+      const ngnAmount = parseFloat(parts.at(2));
+      if (ngnAmount >= 1600) {
+        const ussdMinted = ngnAmount / NGN_RATE;
+        const newBal = Number(user.balance) + ussdMinted;
+        await supabase.from('wallets').update({ balance: newBal }).eq('phone', cleanPhone);
+        await logTransaction(cleanPhone, 'BUY_NGN', ussdMinted, ngnAmount, 'PAYSTACK_VIRTUAL_ACCT');
+        settleOnChain(cleanPhone, user.address, ussdMinted);
+        response = `END Credited ${ussdMinted.toFixed(2)} USSD (NGN ${ngnAmount.toLocaleString()})!\nSettling on Sepolia...\nNew Balance: ${newBal.toFixed(2)} USSD`;
+      } else {
+        response = `END Minimum deposit is NGN 1,600 (1.00 USSD).`;
+      }
+    } else if (text === '4*2') {
+      response = `CON Enter amount in $USSD to cash out:`;
+    } else if (text.startsWith('4*2*')) {
+      const parts = text.split('*');
+      if (parts.length === 3) {
+        response = `CON Enter 10-digit Nigerian Bank Account No:`;
+      } else if (parts.length === 4) {
+        response = `CON Enter your 4-digit PIN to confirm payout:`;
+      } else if (parts.length === 5) {
+        const ussdAmount = parseFloat(parts.at(2));
+        const bankAcct = parts.at(3)?.trim();
+        const enteredPin = parts.at(4)?.trim();
 
-    res.set('Content-Type', 'text/plain');
-    res.send(response);
-  } catch (err) {
-    console.error('USSD error:', err.message);
-    res.set('Content-Type', 'text/plain');
-    res.send('END Temporary service error. Please try again.');
-  }
-});
-
-app.get('/', (req, res) => res.send('USSD Coin Bot Server is Live!'));
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+        if (enteredPin !== user.pin) {
+          response = `END Incorrect PIN. Cash out cancelled.`;
+        } else if (!/^\d{10}$/.test(bankAcct)) {
